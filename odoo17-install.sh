@@ -231,8 +231,15 @@ step_odoo_install() {
     sudo -u "$ODOO_USER" python3 -m venv "${ODOO_HOME}/venv"
 
     log_info "正在安装 Python 依赖（可能需要5-10分钟）..."
-    sudo -u "$ODOO_USER" "${ODOO_HOME}/venv/bin/pip" install -q --upgrade pip wheel
+    sudo -u "$ODOO_USER" "${ODOO_HOME}/venv/bin/pip" install -q --upgrade pip wheel setuptools
+
+    # 预先安装兼容版本的 gevent（原版与 Python 3.10 存在 Cython 兼容性问题）
+    log_info "预装兼容版本 gevent..."
     sudo -u "$ODOO_USER" "${ODOO_HOME}/venv/bin/pip" install -q \
+        "gevent==22.10.2" --no-build-isolation
+
+    sudo -u "$ODOO_USER" "${ODOO_HOME}/venv/bin/pip" install -q \
+        --ignore-installed gevent \
         -r "${ODOO_HOME}/odoo17/requirements.txt"
 
     chown -R "${ODOO_USER}:${ODOO_USER}" "$ODOO_HOME"
