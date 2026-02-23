@@ -1,9 +1,10 @@
 #!/bin/bash
 # =============================================================================
-#  Odoo 17 一键安装脚本 v2.0
+#  Odoo 17 一键安装脚本 v2.1
 #  适用系统：Ubuntu 22.04 LTS
 #  配置目标：2核 2GB RAM VPS
 #  更新内容：修复 gevent/greenlet 兼容性、增加依赖检测、断点续装
+#            修复 PostgreSQL TCP 密码认证、初始安装开放数据库管理界面
 # =============================================================================
 
 set -uo pipefail
@@ -41,6 +42,7 @@ SWAP_SIZE="2G"
 INSTALL_REDIS="true"
 SSL_EMAIL=""
 ADMIN_PASSWD=""
+DB_PASSWD=""
 
 # Python 依赖版本锁定（修复兼容性问题）
 GEVENT_VERSION="22.10.2"
@@ -339,12 +341,32 @@ step_postgresql() {
     systemctl enable postgresql
     systemctl start postgresql
 
+    # 生成随机 DB 密码（保存到变量供后续配置文件使用）
+    DB_PASSWD=$(python3 -c "import secrets; print(secrets.token_urlsafe(16))")
+
     if ! su - postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'\"" 2>/dev/null | grep -q 1; then
         su - postgres -c "createuser -d -R -S ${DB_USER}"
         log_success "已创建 PostgreSQL 用户: ${DB_USER}"
     else
         log_skip "PostgreSQL 用户 ${DB_USER} 已存在"
     fi
+
+    # 设置数据库用户密码（TCP 连接必须有密码，peer 认证仅限 socket）
+    su - postgres -c "psql -c \"ALTER USER ${DB_USER} WITH PASSWORD '${DB_PASSWD}';\""
+    log_success "已设置 PostgreSQL 用户密码"
+
+    # 确保 pg_hba.conf 对 TCP 连接使用 md5 认证（幂等）
+    PG_HBA="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
+    if ! grep -q "odoo.*md5" "$PG_HBA" 2>/dev/null; then
+        # 在 IPv4 local connections 行前插入 odoo 用户的 md5 认证规则
+        sed -i "/^host.*all.*all.*127.0.0.1/i host    all             ${DB_USER}        127.0.0.1/32            md5" "$PG_HBA"
+        log_success "已添加 PostgreSQL md5 认证规则"
+    else
+        log_skip "PostgreSQL md5 认证规则已存在"
+    fi
+
+    # 将 DB_PASSWD 追加到安装配置文件供后续步骤读取
+    echo "DB_PASSWD=\"${DB_PASSWD}\"" >> /root/.odoo17_install_config
 
     PG_VERSION=$(pg_lsclusters -h | awk '{print $1}' | head -1)
     PG_CONF="/etc/postgresql/${PG_VERSION}/main/postgresql.conf"
@@ -597,6 +619,11 @@ step_odoo_config() {
     log_step "Step 9/10: 生成 Odoo 配置 & 启动服务"
 
     if [[ ! -f "$ODOO_CONF" ]]; then
+        # 断点续装时从配置文件恢复 DB_PASSWD
+        if [[ -z "${DB_PASSWD:-}" && -f /root/.odoo17_install_config ]]; then
+            source /root/.odoo17_install_config
+        fi
+
         cat > "$ODOO_CONF" << EOF
 [options]
 ;; ── 基础配置 ──
@@ -604,7 +631,7 @@ admin_passwd = ${ADMIN_PASSWD}
 db_host = localhost
 db_port = 5432
 db_user = ${DB_USER}
-db_password = False
+db_password = ${DB_PASSWD}
 db_name = False
 
 ;; ── 路径 ──
@@ -631,7 +658,8 @@ log_level = warn
 log_handler = :WARNING
 
 ;; ── 安全 ──
-list_db = False
+;; 初始安装保持开放，创建数据库后如需禁用请取消下行注释并重启服务
+;; list_db = False
 EOF
         chmod 640 "$ODOO_CONF"
         chown "${ODOO_USER}:${ODOO_USER}" "$ODOO_CONF"
@@ -938,6 +966,18 @@ print_summary() {
     echo -e "${CYAN}Odoo 主控密码 :${NC} ${RED}${display_passwd}${NC}"
     echo -e "${YELLOW}⚠️  主控密码用于创建/删除数据库，请立即保存！${NC}\n"
 
+    # 读取 DB 密码
+    local db_passwd=""
+    if [[ -f /root/.odoo17_install_config ]]; then
+        db_passwd=$(grep "DB_PASSWD" /root/.odoo17_install_config | cut -d'"' -f2)
+    fi
+    [[ -n "$db_passwd" ]] && echo -e "${CYAN}DB 用户密码   :${NC} ${db_passwd}（odoo@localhost）"
+
+    echo -e ""
+    echo -e "${YELLOW}提示：初始安装已开放数据库管理界面，创建数据库后建议执行：${NC}"
+    echo -e "  sed -i 's/^;; list_db/list_db/' ${ODOO_CONF} && systemctl restart ${ODOO_SERVICE}"
+    echo -e ""
+
     echo -e "${CYAN}配置文件 :${NC} ${ODOO_CONF}"
     echo -e "${CYAN}Odoo日志 :${NC} ${ODOO_LOG}"
     echo -e "${CYAN}Nginx    :${NC} /etc/nginx/sites-available/${ODOO_SERVICE}\n"
@@ -958,9 +998,14 @@ Odoo 17 部署信息
 部署时间   : $(date)
 访问地址   : ${PROTOCOL}://${DOMAIN}
 主控密码   : ${display_passwd}
+DB用户密码 : ${db_passwd}
 配置文件   : ${ODOO_CONF}
 Odoo 日志  : ${ODOO_LOG}
 gevent版本 : ${GEVENT_VERSION}
+
+【安全提醒】
+创建数据库后，建议禁用数据库管理界面：
+  sed -i 's/^;; list_db/list_db/' ${ODOO_CONF} && systemctl restart ${ODOO_SERVICE}
 EOF
     chmod 600 /root/odoo17-deploy-info.txt
     echo -e "${GREEN}部署信息已保存至 /root/odoo17-deploy-info.txt${NC}"
